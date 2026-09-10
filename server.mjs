@@ -323,6 +323,15 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  if (req.socket) {
+    req.socket.setNoDelay(true);
+  }
+
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
   clients.set(userId, ws);
   console.log(`[DevGateway] User connected: ${userId}`);
 
@@ -409,13 +418,44 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'ping': {
+          ws.isAlive = true;
+          ws.send(JSON.stringify({ type: 'pong' }));
+          break;
+        }
+
+        case 'pong': {
+          ws.isAlive = true;
+          break;
+        }
+
         case 'chat_message': {
           const roomId = userToRoom.get(userId);
-          if (!roomId || !rooms.has(roomId)) return;
+          if (!roomId || !rooms.has(roomId)) {
+            ws.send(
+              JSON.stringify({
+                type: 'partner_disconnected',
+                room_id: roomId || '',
+                data: { message: 'Stranger is no longer in this room. Click Next to find someone new.' },
+              })
+            );
+            return;
+          }
 
           const room = rooms.get(roomId);
           const partnerId = room.user1.userId === userId ? room.user2.userId : room.user1.userId;
           const partnerWs = clients.get(partnerId);
+
+          if (!partnerWs || partnerWs.readyState !== 1) {
+            ws.send(
+              JSON.stringify({
+                type: 'partner_status',
+                room_id: roomId,
+                data: { status: 'reconnecting', graceSeconds: 15 },
+              })
+            );
+            return;
+          }
 
           const mod = moderateMessage(msg.text || '');
           if (!mod.allowed) {
@@ -554,6 +594,24 @@ wss.on('connection', (ws, req) => {
     }
   });
 });
+
+// Periodic server-side ping keepalive to prevent Cloud / Render proxy idle disconnects
+const heartbeatInterval = setInterval(() => {
+  for (const [userId, ws] of clients.entries()) {
+    if (ws.isAlive === false) {
+      console.log(`[Heartbeat] Inactive client timeout: ${userId}`);
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    if (ws.readyState === 1) {
+      try {
+        ws.ping();
+        ws.send(JSON.stringify({ type: 'ping' }));
+      } catch (err) {}
+    }
+  }
+}, 10000);
 
 server.listen(PORT, () => {
   console.log(`[DevGateway] AuraChat Dev Gateway listening on http://localhost:${PORT} and ws://localhost:${PORT}/ws`);
